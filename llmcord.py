@@ -1,8 +1,11 @@
 import asyncio
 from base64 import b64encode
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import re
+import time
 from typing import Any, Literal, Optional
 
 import discord
@@ -28,6 +31,14 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
 
+# --- Era-format <-> Discord ping translator ---
+# Talkie sees "Correspondent No. 123456789:" but Discord pings with <@123456789>
+_CORRESPONDENT_PATTERN = re.compile(r"Correspondent No\.\s*(\d+)(:)")
+
+def era_to_discord(text: str) -> str:
+    """Convert era-appropriate 'Correspondent No. N:' back to Discord <@N> pings."""
+    return _CORRESPONDENT_PATTERN.sub(r"<@\1>:", text)
+
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
@@ -39,6 +50,11 @@ curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
 last_task_time = 0
+
+# Per-channel/thread mutable context tracking
+# When a user runs /context open, subsequent messages in that channel can be pulled
+t_mutable_context = {}  # channel_id -> {opener_id, opened_at, ttl_seconds}
+MUTABLE_CONTEXT_TTL = 900  # 15 minutes
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -93,6 +109,236 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     return choices[:25]
 
 
+@discord_bot.tree.command(name="context", description="View context, clear memory cache, or show bot status")
+async def context_command(
+    interaction: discord.Interaction,
+    action: str,
+) -> None:
+    channel = interaction.channel
+
+    # ── /context status ──────────────────────────────────────────────
+    if action == "status":
+        max_messages = config.get("max_messages", 25)
+        max_seq_len = 4096
+        system_prompt_enabled = bool(config.get("system_prompt"))
+        system_tokens_est = 200 if system_prompt_enabled else 0
+        cached_nodes = len(msg_nodes)
+        max_nodes = MAX_MESSAGE_NODES
+
+        lines = [
+            f"**📊 Bot Status**\n",
+            f"```\n"
+            f"Model:            {curr_model}\n"
+            f"Max messages:      {max_messages}\n"
+            f"Context window:    {max_seq_len} tokens\n"
+            f"System prompt:     {'✅ enabled' if system_prompt_enabled else '❌ disabled'} (~{system_tokens_est} tokens)\n"
+            f"Msg cache:         {cached_nodes} / {max_nodes} nodes\n"
+            f"Allow DMs:        {'✅' if config.get('allow_dms', False) else '❌'}\n"
+            f"Max text:          {config.get('max_text', 100000):,} chars\n"
+            f"Max images:        {config.get('max_images', 0)}\n"
+            f"Plain responses:   {'✅' if config.get('use_plain_responses', False) else '❌'}\n"
+            f"```",
+        ]
+
+        # Check if Talkie server is reachable
+        try:
+            import httpx as _hx
+            async with _hx.AsyncClient() as _c:
+                _r = await _c.get(config["providers"][curr_model.split("/")[0]]["base_url"].rstrip("/") + "/models", timeout=5.0)
+                if _r.status_code == 200:
+                    model_list = _r.json().get("data", [])
+                    server_model = model_list[0]["id"] if model_list else "unknown"
+                    lines.append(f"🔌 Inference server: **online** (`{server_model}`)")
+                else:
+                    lines.append(f"🔌 Inference server: ⚠️ responding with status {_r.status_code}")
+        except Exception:
+            lines.append("🔌 Inference server: **offline** — bot will not be able to respond")
+
+        embed = discord.Embed(description="\n".join(lines), color=discord.Color.blurple())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # ── /context clear ───────────────────────────────────────────────
+    if action == "clear":
+        if channel is None:
+            await interaction.response.send_message("⚠️ This can only be used in a channel or DM.", ephemeral=True)
+            return
+
+        # Count before
+        before = len(msg_nodes)
+
+        if channel.type == discord.ChannelType.private:
+            # DMs: clear all nodes for this DM channel
+            to_remove = [mid for mid, node in msg_nodes.items() if node.parent_msg is not None]
+            # Simpler approach: clear everything for a DM reset
+            msg_nodes.clear()
+            after = 0
+        else:
+            # Guild channel: clear nodes whose messages belong to this channel
+            # We can't easily know which nodes belong to which channel from the
+            # node data alone, so clear the entire cache (it rebuilds on next message)
+            msg_nodes.clear()
+            after = 0
+
+        cleared = before - after
+        output = f"🗑️ Cleared **{cleared}** message{'s' if cleared != 1 else ''} from cache.\n\nNext reply to the bot will start with fresh context. The cache rebuilds automatically as new messages are processed."
+
+        embed = discord.Embed(description=output, color=discord.Color.red())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logging.info(f"[context clear] Purged {cleared} message nodes from cache (invoked by {interaction.user})")
+        return
+
+    # ── /context reopen ───────────────────────────────────────────────
+    if action == "reopen":
+        if channel is None:
+            await interaction.response.send_message("⚠️ This can only be used in a channel or DM.", ephemeral=True)
+            return
+
+        t_mutable_context[channel.id] = dict(
+            opener_id=interaction.user.id,
+            opened_at=time.time(),
+            ttl_seconds=MUTABLE_CONTEXT_TTL
+        )
+        output = (
+            f"📂 **This conversation is now open for 15 minutes.**\n\n"
+            f"Any user who @-mentions the bot in this channel will be included in the context.\n\n"
+            f"Use `/context clear` to reset manually, or wait for the timer to expire."
+        )
+        embed = discord.Embed(description=output, color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=False)
+        logging.info(f"[context reopen] Channel {channel.id} opened by {interaction.user.id} for {MUTABLE_CONTEXT_TTL}s")
+        return
+
+    # ── /context show (default) ──────────────────────────────────────
+    if channel is None:
+        await interaction.response.send_message("⚠️ This can only be used in a channel or DM.", ephemeral=True)
+        return
+
+    # Try to get the most recent message in the channel to trace context from
+    try:
+        history = [m async for m in channel.history(limit=1)]
+        target_msg = history[0] if history else None
+    except (discord.Forbidden, discord.HTTPException):
+        target_msg = None
+
+    if not target_msg or target_msg.author == discord_bot.user:
+        # If the latest message is from the bot, try one more back
+        try:
+            history = [m async for m in channel.history(limit=2)]
+            target_msg = next((m for m in history if m.author != discord_bot.user), None)
+        except (discord.Forbidden, discord.HTTPException):
+            target_msg = None
+
+    if not target_msg:
+        await interaction.response.send_message("⚠️ Could not find a message to trace context from. Try using this in a channel with messages.", ephemeral=True)
+        return
+
+    # Replicate the context-building logic from on_message
+    max_messages = config.get("max_messages", 25)
+    max_text = config.get("max_text", 100000)
+    messages = []
+    curr_msg = target_msg
+    chain_count = 0
+
+    while curr_msg is not None and len(messages) < max_messages:
+        curr_node = msg_nodes.get(curr_msg.id)
+
+        if curr_node and curr_node.text is not None:
+            text = curr_node.text
+            role = curr_node.role
+        else:
+            # Message not in cache — build a summary from what we can see
+            role = "assistant" if curr_msg.author == discord_bot.user else "user"
+            text = curr_msg.content[:max_text] if curr_msg.content else "(no text / not in cache)"
+
+        content = text[:max_text] if text else "(empty)"
+        if content:
+            messages.append(dict(role=role, content=content, author=curr_msg.author.display_name))
+
+        chain_count += 1
+
+        # Walk the reply chain
+        parent = None
+        try:
+            if curr_msg.reference and curr_msg.reference.message_id:
+                parent = curr_msg.reference.cached_message or await channel.fetch_message(curr_msg.reference.message_id)
+            elif curr_msg.channel.type == discord.ChannelType.public_thread:
+                # In threads without explicit replies, just stop
+                break
+            else:
+                # Check if previous message in channel is from the same chain
+                prev_msgs = [m async for m in channel.history(before=curr_msg, limit=1)]
+                if prev_msgs:
+                    prev = prev_msgs[0]
+                    if prev.author == (discord_bot.user if channel.type == discord.ChannelType.private else curr_msg.author):
+                        if prev.type in (discord.MessageType.default, discord.MessageType.reply):
+                            parent = prev
+        except (discord.NotFound, discord.HTTPException):
+            break
+
+        curr_msg = parent
+
+    # Build the display
+    max_seq_len = 4096  # Default for Talkie; could be read from model config
+    system_prompt_enabled = bool(config.get("system_prompt"))
+    system_tokens_est = 200 if system_prompt_enabled else 0
+
+    # Rough token estimate: ~4 chars per token for English
+    total_chars = sum(len(m["content"]) for m in messages)
+    estimated_tokens = total_chars // 4 + system_tokens_est
+
+    lines = []
+    lines.append(f"**📌 Context for this channel**\n")
+    lines.append(f"```\n"
+                 f"Model:            {curr_model}\n"
+                 f"Max messages:      {max_messages}\n"
+                 f"Context window:    {max_seq_len} tokens\n"
+                 f"System prompt:     {'✅ enabled' if system_prompt_enabled else '❌ disabled'} (~{system_tokens_est} tokens)\n"
+                 f"Cache nodes:       {len(msg_nodes)} / {MAX_MESSAGE_NODES}\n"
+                 f"```\n")
+    lines.append(f"**Reply chain:** {chain_count} message{'s' if chain_count != 1 else ''} traced (estimated ~{estimated_tokens} tokens + ~{system_tokens_est} system = **~{estimated_tokens + system_tokens_est} of {max_seq_len}** tokens used)\n")
+
+    # Token budget bar
+    pct = min((estimated_tokens + system_tokens_est) / max_seq_len, 1.0)
+    bar_len = 20
+    filled = round(pct * bar_len)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    color = "🟢" if pct < 0.5 else "🟡" if pct < 0.8 else "🔴"
+    lines.append(f"{color} `{bar}` {pct:.0%}\n")
+
+    # Show the message chain
+    lines.append(f"**Messages in chain** (newest → oldest):\n")
+    for i, msg in enumerate(messages):
+        role_icon = "🤖" if msg["role"] == "assistant" else "👤"
+        preview = msg["content"][:120].replace("\n", " ")
+        if len(msg["content"]) > 120:
+            preview += "…"
+        lines.append(f"{role_icon} `{msg['role']:9s}` **{msg['author']}**: {preview}")
+
+    if chain_count >= max_messages:
+        lines.append(f"\n⚠️ Chain truncated at {max_messages} messages. Older messages are not included.")
+
+    output = "\n".join(lines)
+
+    # Discord has a 4096 char limit on embed descriptions
+    if len(output) > 4000:
+        output = output[:3990] + "\n…(truncated)"
+
+    embed = discord.Embed(description=output, color=discord.Color.blurple())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@context_command.autocomplete("action")
+async def context_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
+    options = [
+        ("show", "📌 Show context for this channel"),
+        ("status", "📊 Bot status & server health"),
+        ("clear", "🗑️ Clear message cache (fresh start)"),
+        ("reopen", "📂 Re-open this conversation for 15 min (allow others to @-mention)"),
+    ]
+    return [Choice(name=label, value=value) for value, label in options if curr_str.lower() in value or curr_str.lower() in label.lower()]
+
+
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config.get("client_id"):
@@ -107,8 +353,35 @@ async def on_message(new_msg: discord.Message) -> None:
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
 
-    if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
+    # ── Gating: when does the bot respond? ────────────────────────────
+    if new_msg.author.bot:
         return
+
+    # Always respond in DMs
+    should_respond = is_dm
+
+    # In guild channels: require @-mention OR reply to the bot
+    bot_mentioned = discord_bot.user in new_msg.mentions
+    is_reply_to_bot = bool(new_msg.reference and new_msg.reference.resolved and new_msg.reference.resolved.author == discord_bot.user)
+
+    if not is_dm and (bot_mentioned or is_reply_to_bot):
+        should_respond = True
+
+    # Mutable context: if no @-mention, check if someone ran /context reopen
+    if not should_respond and not is_dm:
+        mc = t_mutable_context.get(new_msg.channel.id)
+        if mc and (time.time() - mc["opened_at"]) < mc["ttl_seconds"]:
+            # Only respond if this message @-mentions the bot (others still need to ping)
+            if bot_mentioned:
+                should_respond = True
+        elif mc:
+            # Expired — clean up
+            del t_mutable_context[new_msg.channel.id]
+
+    if not should_respond:
+        return
+
+    # ── End gating ────────────────────────────────────────────────────
 
     role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
     channel_ids = set(filter(None, (new_msg.channel.id, getattr(new_msg.channel, "parent_id", None), getattr(new_msg.channel, "category_id", None))))
@@ -189,7 +462,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 ]
 
                 if curr_node.role == "user" and (curr_node.text or curr_node.images):
-                    curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
+                    curr_node.text = f"Correspondent No. {curr_msg.author.id}: {curr_node.text}"
 
                 curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
 
@@ -236,6 +509,11 @@ async def on_message(new_msg: discord.Message) -> None:
             curr_msg = curr_node.parent_msg
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+    # OBSESSIVE: log the entire message chain that was built
+    logging.debug(f"[MSG_CHAIN] {len(messages)} messages traced; reversed for API:")
+    for i, msg in enumerate(messages[::-1]):
+        content_preview = repr(msg.get('content', '')[:200] if isinstance(msg.get('content'), str) else str(msg.get('content'))[:200])
+        logging.debug(f"  [MSG {i}] role={msg.get('role')} content={content_preview}")
 
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
@@ -250,6 +528,12 @@ async def on_message(new_msg: discord.Message) -> None:
     response_contents = []
 
     openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
+
+    logging.info(f"[API_CALL] model={model} stream=True messages_count={len(messages[::-1])}")
+    logging.debug(f"[API_KWARGS] {json.dumps(openai_kwargs, default=str)[:3000]}")
+
+    chunk_counter = [0]  # mutable via closure
+    all_content_parts = []  # assemble EVERYTHING for comparison
 
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
@@ -271,34 +555,48 @@ async def on_message(new_msg: discord.Message) -> None:
                 if finish_reason != None:
                     break
 
-                if not (choice := chunk.choices[0] if chunk.choices else None):
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    logging.debug(f"[CHUNK] no choice in chunk, skipping")
                     continue
 
                 finish_reason = choice.finish_reason
+                chunk_counter[0] += 1
 
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
+                # In OpenAI SSE streaming, delta.content is the NEW text for this chunk only.
+                # Do NOT accumulate with prev_content — that causes duplication.
+                delta_content = choice.delta.content or ""
 
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
+                # OBSESSIVE: log EVERY chunk content and state
+                logging.debug(
+                    f"[CHUNK #{chunk_counter[0]}] finish={finish_reason} "
+                    f"delta={repr(delta_content)}"
+                )
+                if delta_content:
+                    all_content_parts.append(delta_content)
 
-                if response_contents == [] and new_content == "":
+                if response_contents == [] and delta_content == "":
+                    logging.debug(f"[CHUNK] skipping empty initial content")
                     continue
 
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
+                if start_next_msg := response_contents == [] or len(response_contents[-1] + delta_content) > max_message_length:
                     response_contents.append("")
+                    logging.debug(f"[CHUNK] starting new msg segment, response_contents now {len(response_contents)} segments")
 
-                response_contents[-1] += new_content
+                response_contents[-1] += delta_content
+                logging.debug(f"[CHUNK] response_contents[-1] now {len(response_contents[-1])} chars: {repr(response_contents[-1][-80:])}")
 
                 if not use_plain_responses:
                     time_delta = datetime.now().timestamp() - last_task_time
 
                     ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
+                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + delta_content) > max_message_length
                     is_final_edit = finish_reason != None or msg_split_incoming
                     is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
 
                     if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
+                        display_text = era_to_discord(response_contents[-1])
+                        embed.description = display_text if is_final_edit else (display_text + STREAMING_INDICATOR)
                         embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
 
                         if start_next_msg:
@@ -311,10 +609,34 @@ async def on_message(new_msg: discord.Message) -> None:
 
             if use_plain_responses:
                 for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=era_to_discord(content))))
 
     except Exception:
         logging.exception("Error while generating response")
+        logging.error(
+            f"[STREAM_ERROR] after {chunk_counter[0]} chunks, "
+            f"assembled {len(''.join(all_content_parts))} chars from parts, "
+            f"response_contents has {len(response_contents)} segments"
+        )
+
+    # OBSESSIVE: final assembly logging
+    assembled_from_parts = "".join(all_content_parts)
+    assembled_from_segments = "".join(response_contents)
+    logging.info(
+        f"[STREAM_DONE] chunks={chunk_counter[0]} "
+        f"parts_assembled={len(assembled_from_parts)} "
+        f"segments_assembled={len(assembled_from_segments)} "
+        f"finish_reason={finish_reason}"
+    )
+    logging.debug(f"[STREAM_DONE] full_parts_text={repr(assembled_from_parts[:500])}")
+    logging.debug(f"[STREAM_DONE] full_segments_text={repr(assembled_from_segments[:500])}")
+    if assembled_from_parts != assembled_from_segments:
+        diff_positions = [i for i in range(min(len(assembled_from_parts), len(assembled_from_segments)))
+                         if assembled_from_parts[i] != assembled_from_segments[i]]
+        logging.warning(
+            f"[MISMATCH] parts ({len(assembled_from_parts)}) != segments ({len(assembled_from_segments)})! "
+            f"DiffPositions[:20]={diff_positions[:20]}"
+        )
 
     for response_msg in response_msgs:
         msg_nodes[response_msg.id].text = "".join(response_contents)
