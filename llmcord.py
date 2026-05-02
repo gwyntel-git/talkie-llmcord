@@ -49,51 +49,183 @@ VISION_PROXY_SYSTEM = (
 )
 
 
+async def _wait_for_vlm_ready(
+    vision_url: str,
+    httpx_client: httpx.AsyncClient,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
+) -> bool:
+    """Pre-flight health check: wait for SwiftLM to have the model loaded.
+
+    Pings /health and checks that status is 'ok' (not 'sleeping' / evicted).
+    Returns True if the VLM is ready, False if it couldn't wake up in time.
+    On eviction, this triggers SwiftLM's lazy reload so the actual request
+    will succeed once the model is loaded.
+    """
+    import logging as _log
+    _logger = _log.getLogger("vision_proxy")
+
+    # SwiftLM health is at the root (no /v1 prefix)
+    health_url = vision_url.replace("/v1", "").rstrip("/") + "/health"
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = await httpx_client.get(health_url, timeout=10.0)
+            if resp.status_code == 200:
+                body = resp.json()
+                status = body.get("status", "unknown")
+                model_loaded = body.get("model_loaded", True)  # older SwiftLM omits this
+                if status == "ok" and model_loaded:
+                    _logger.info("[VISION_PROXY] VLM health check: model loaded and ready")
+                    return True
+                elif status in ("sleeping", "loading") or not model_loaded:
+                    _logger.warning(
+                        f"[VISION_PROXY] VLM health check: status={status}, "
+                        f"model_loaded={model_loaded} (attempt {attempt}/{max_retries})"
+                    )
+                    # Send a warm-up request to trigger lazy reload
+                    if status == "sleeping":
+                        _logger.info("[VISION_PROXY] Triggering lazy reload with warm-up request...")
+                        try:
+                            await httpx_client.post(
+                                f"{vision_url}/chat/completions",
+                                json={
+                                    "model": body.get("model", ""),
+                                    "messages": [{"role": "user", "content": "hi"}],
+                                    "max_tokens": 1,
+                                    "stream": False,
+                                },
+                                timeout=30.0,
+                            )
+                        except Exception:
+                            pass  # we just want to trigger the load
+                    if attempt < max_retries:
+                        _logger.info(f"[VISION_PROXY] Waiting {retry_delay}s for model reload...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        _logger.error("[VISION_PROXY] VLM still not ready after warm-up attempts")
+                        return False
+                else:
+                    # Unknown status but 200 — assume ready
+                    _logger.info(f"[VISION_PROXY] VLM health check: status={status} (assuming ready)")
+                    return True
+            else:
+                _logger.warning(
+                    f"[VISION_PROXY] VLM health check returned {resp.status_code} "
+                    f"(attempt {attempt}/{max_retries})"
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                return False
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            _logger.warning(
+                f"[VISION_PROXY] VLM health check connection error "
+                f"(attempt {attempt}/{max_retries}): {exc}"
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(retry_delay)
+                continue
+            return False
+        except Exception:
+            _log.getLogger("vision_proxy").exception("[VISION_PROXY] VLM health check failed")
+            return False
+
+    return False
+
+
 async def _describe_image_via_vision_proxy(
     b64_image: str,
     content_type: str,
     vision_url: str,
     vision_model: str,
     httpx_client: httpx.AsyncClient,
+    max_retries: int = 3,
+    retry_delay: float = 5.0,
 ) -> str | None:
-    """Send an image to a local VLM and get an Edwardian-era description."""
-    try:
-        import logging as _log
-        _logger = _log.getLogger("vision_proxy")
-        data_url = f"data:{content_type};base64,{b64_image}"
-        payload = {
-            "model": vision_model,
-            "messages": [
-                {"role": "system", "content": VISION_PROXY_SYSTEM},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe this photograph."},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                },
-            ],
-            "max_tokens": 150,
-            "temperature": 0.4,
-            "stream": False,
-        }
-        resp = await httpx_client.post(
-            f"{vision_url}/chat/completions",
-            json=payload,
-            timeout=30.0,
-        )
-        if resp.status_code == 200:
-            body = resp.json()
-            desc = body["choices"][0]["message"]["content"].strip()
-            _logger.info(f"[VISION_PROXY] Image described: {desc[:80]}...")
-            return desc
-        else:
-            _logger.warning(f"[VISION_PROXY] VLM returned {resp.status_code}: {resp.text[:200]}")
-            return None
-    except Exception:
-        import logging as _log
-        _log.getLogger("vision_proxy").exception("[VISION_PROXY] Failed to describe image")
+    """Send an image to a local VLM and get an Edwardian-era description.
+
+    Performs a pre-flight health check to detect evicted models, then
+    retries on transient failures (model evicted, connection refused, 503)
+    to allow SwiftLM time to reload the model from idle eviction.
+    """
+    import logging as _log
+    _logger = _log.getLogger("vision_proxy")
+
+    # Pre-flight: check if SwiftLM has the model loaded
+    vlm_ready = await _wait_for_vlm_ready(
+        vision_url, httpx_client,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+    )
+    if not vlm_ready:
+        _logger.error("[VISION_PROXY] VLM not ready after pre-flight checks, skipping image description")
         return None
+
+    data_url = f"data:{content_type};base64,{b64_image}"
+    payload = {
+        "model": vision_model,
+        "messages": [
+            {"role": "system", "content": VISION_PROXY_SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this photograph."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "max_tokens": 150,
+        "temperature": 0.4,
+        "stream": False,
+    }
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = await httpx_client.post(
+                f"{vision_url}/chat/completions",
+                json=payload,
+                timeout=60.0,
+            )
+            if resp.status_code == 200:
+                body = resp.json()
+                desc = body["choices"][0]["message"]["content"].strip()
+                _logger.info(f"[VISION_PROXY] Image described: {desc[:80]}...")
+                return desc
+            elif resp.status_code in (503, 529) or "model not loaded" in resp.text.lower():
+                # Model evicted — SwiftLM needs to reload
+                _logger.warning(
+                    f"[VISION_PROXY] VLM not ready (attempt {attempt}/{max_retries}, "
+                    f"status {resp.status_code}): {resp.text[:200]}"
+                )
+                if attempt < max_retries:
+                    _logger.info(f"[VISION_PROXY] Waiting {retry_delay}s for model reload...")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                else:
+                    _logger.error("[VISION_PROXY] Max retries reached, VLM still not ready")
+                    return None
+            else:
+                _logger.warning(f"[VISION_PROXY] VLM returned {resp.status_code}: {resp.text[:200]}")
+                return None
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            # SwiftLM process might be starting up or model loading
+            _logger.warning(
+                f"[VISION_PROXY] Connection error (attempt {attempt}/{max_retries}): {exc}"
+            )
+            if attempt < max_retries:
+                _logger.info(f"[VISION_PROXY] Waiting {retry_delay}s for VLM to become available...")
+                await asyncio.sleep(retry_delay)
+                continue
+            else:
+                _logger.error("[VISION_PROXY] Max retries reached, VLM unreachable")
+                return None
+        except Exception:
+            _log.getLogger("vision_proxy").exception("[VISION_PROXY] Failed to describe image")
+            return None
+
+    return None
 
 # --- Era-format <-> Discord ping translator ---
 # Talkie sees "Correspondent No. 123456789:" but Discord pings with <@123456789>
@@ -633,6 +765,8 @@ async def on_message(new_msg: discord.Message) -> None:
                 if image_attachments and vision_proxy and vision_proxy.get("enabled"):
                     vp_url = vision_proxy["base_url"].rstrip("/") + "/v1"
                     vp_model = vision_proxy["model"]
+                    vp_retries = vision_proxy.get("max_retries", 3)
+                    vp_retry_delay = vision_proxy.get("retry_delay", 5.0)
                     vp_descs = await asyncio.gather(*[
                         _describe_image_via_vision_proxy(
                             b64encode(resp.content).decode("utf-8"),
@@ -640,6 +774,8 @@ async def on_message(new_msg: discord.Message) -> None:
                             vp_url,
                             vp_model,
                             httpx_client,
+                            max_retries=vp_retries,
+                            retry_delay=vp_retry_delay,
                         )
                         for att, resp in image_attachments
                     ])
