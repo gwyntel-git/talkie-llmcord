@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/gwyntel-git/talkie-llmcord)
+
 <h1 align="center">
   llmcord
 </h1>
